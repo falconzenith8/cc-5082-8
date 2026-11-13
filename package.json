@@ -1,0 +1,14 @@
+{
+  "name": "spectator-service",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Delay-rebuilt, information-filtered spectator view service for multiplayer matches",
+  "scripts": {
+    "test": "node --test test/",
+    "demo": "node demo/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
