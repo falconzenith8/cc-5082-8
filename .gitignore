@@ -1,5 +1,6 @@
 # solo-manager GitHub sync ignores
 node_modules/
+bench/out/
 vendor/
 dist/
 build/

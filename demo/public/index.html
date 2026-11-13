@@ -10,7 +10,7 @@
   .panel { flex: 1; min-width: 0; }
   .panel h2 { font-size: 13px; margin: 4px 0; }
   canvas { width: 100%; background: #181d27; border: 1px solid #2a3242; border-radius: 6px; }
-  .bar { display: flex; gap: 12px; align-items: baseline; font-size: 12px; margin: 6px 0; }
+  .bar { display: flex; gap: 12px; align-items: center; font-size: 12px; margin: 6px 0; flex-wrap: wrap; }
   .score { font-size: 20px; font-weight: 700; }
   .banner { min-height: 16px; font-size: 12px; color: #ffb454; }
   .log { font-size: 11px; color: #8fa1bd; height: 96px; overflow: hidden; white-space: pre-line; }
@@ -18,8 +18,13 @@
   td, th { padding: 1px 8px; border-bottom: 1px solid #232b3a; text-align: right; }
   th { color: #8fa1bd; }
   button, input { background: #1d2432; color: #dfe6f0; border: 1px solid #2a3242; border-radius: 4px; font: inherit; font-size: 12px; padding: 3px 8px; }
-  input { width: 40px; }
+  .tab.on { border-color: #5aa2ff; color: #5aa2ff; }
   .a { color: #5aa2ff; } .b { color: #ff6a5a; }
+  .status { font-size: 11px; color: #9fb4d8; background: #141926; border: 1px solid #232b3a; border-radius: 6px; padding: 6px 8px; white-space: pre-line; margin: 6px 0; }
+  .anomaly { font-size: 11px; border-radius: 6px; padding: 4px 8px; margin: 4px 0; white-space: pre-line; }
+  .anomaly.ok { color: #3fd67c; background: #14201a; }
+  .anomaly.bad { color: #ff6a5a; background: #241416; }
+  input[type=range] { width: 200px; }
 </style>
 </head>
 <body>
@@ -33,13 +38,26 @@
     <table id="pstats"></table>
   </div>
   <div class="panel">
-    <h2>观众视图 · 延迟 <input id="delay" value="5" size="2">s · 观战时钟 t=<span id="st">0.0</span>s
+    <h2>观众视图 ·
+      <button class="tab on" id="tabA">观众A · 延迟5s</button>
+      <button class="tab" id="tabB">观众B · 延迟12s</button>
+      <label title="开：共享缓存（优化后）；关：每连接全量重建（基线）"><input type="checkbox" id="opt" checked> 共享缓存优化</label>
+    </h2>
+    <div class="bar">
+      <span>观战时钟 t=<span id="st">0.0</span>s</span>
       <button id="reconnect">模拟断线重连</button>
       <label><input type="checkbox" id="slowpoll"> 低速轮询(触发缓冲不足)</label>
-    </h2>
+    </div>
+    <div class="bar">
+      <span>拖动时间：</span>
+      <input type="range" id="seek" min="0" max="25" step="0.5" value="0">
+      <span id="seeklabel">跟随延迟边缘</span>
+    </div>
     <canvas id="sc" width="800" height="600"></canvas>
     <div class="bar"><span class="score a">A <span id="ssa">0</span></span>:<span class="score b"><span id="ssb">0</span> B</span><span id="sstate"></span></div>
     <div class="banner" id="banner"></div>
+    <div class="anomaly ok" id="anomaly">公开状态检查：无异常</div>
+    <div class="status" id="status">运行状态加载中…</div>
     <div class="log" id="slog"></div>
     <table id="sstats"></table>
   </div>
@@ -48,7 +66,24 @@
 import { initialState, applyEvent } from '/src/state.js';
 
 const player = { state: initialState(), effects: [], log: [] };
-const spec = { state: initialState(), effects: [], log: [], sessionId: null, lastSeq: 0, ws: null };
+
+// Two independent spectator connections sharing the server-side cache.
+const specs = {
+  A: makeSpec('A', 5),
+  B: makeSpec('B', 12),
+};
+let active = 'A';
+let optimizedMode = true;
+const anomalies = [];
+let anomalyCount = 0;
+
+function makeSpec(id, delay) {
+  return {
+    id, delay, ws: null, sessionId: null, lastSeq: 0, lastClock: 0,
+    state: initialState(), preview: null, previewT: 0,
+    effects: [], log: [], cloaked: new Map(), seen: [], lastScore: { A: 0, B: 0 },
+  };
+}
 
 function connectPlayer() {
   const ws = new WebSocket(`ws://${location.host}/ws/player`);
@@ -60,50 +95,158 @@ function connectPlayer() {
   ws.onclose = () => setTimeout(connectPlayer, 1000);
 }
 
-function connectSpectator(reconnect = false) {
-  if (spec.ws) spec.ws.close();
-  const delay = Number(document.querySelector('#delay').value) || 5;
+function connectSpec(k, reconnect = false) {
+  const S = specs[k];
+  if (S.ws) S.ws.close();
   const slow = document.querySelector('#slowpoll').checked;
-  const params = new URLSearchParams({ delay });
+  const params = new URLSearchParams({ delay: S.delay, mode: optimizedMode ? 'optimized' : 'baseline' });
   if (slow) { params.set('pollMs', '3000'); params.set('bufferMax', '20'); }
-  if (reconnect && spec.sessionId) { params.set('sessionId', spec.sessionId); params.set('lastSeq', String(spec.lastSeq)); }
+  if (reconnect && S.sessionId) { params.set('sessionId', S.sessionId); params.set('lastSeq', String(S.lastSeq)); }
   const ws = new WebSocket(`ws://${location.host}/ws/spectator?${params}`);
-  spec.ws = ws;
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.kind === 'snapshot') {
-      spec.state = msg.state; spec.state.t = msg.t; spec.sessionId = msg.sessionId; spec.lastSeq = msg.seq;
-      banner(msg.rebuilt ? `已重建快照 @t=${msg.t.toFixed(1)}（显式重建，非读取当前内存）` : '');
-      slog(spec, `— 快照 @t=${msg.t.toFixed(1)}${msg.rebuilt ? '（重建）' : ''} —`);
-    } else if (msg.kind === 'resume') {
-      banner(''); slog(spec, `— 断线重连：从 seq=${msg.fromSeq} 继续 —`);
-    } else if (msg.kind === 'events') {
-      spec.lastSeq = msg.lastSeq;
-      for (const ev of msg.events) handle(spec, ev, false);
-    } else if (msg.kind === 'stalled') {
-      banner(`观战缓冲不足（${msg.reason}，丢弃 ${msg.dropped} 条）— 停留并重建`);
-      slog(spec, `— 缓冲不足，停留 —`);
-    } else if (msg.kind === 'stall') {
-      banner(`数据未就绪（${msg.reason}），${(msg.retryAfterMs / 1000).toFixed(1)}s 后重试`);
-    } else if (msg.kind === 'end') {
-      banner(`比赛结束：${msg.result.winner} 胜`);
-      slog(spec, `— 比赛结束：${JSON.stringify(msg.result.score)} —`);
-    }
-  };
-  ws.onclose = () => { if (spec.ws === ws) banner('连接断开'); };
+  S.ws = ws;
+  ws.onmessage = (m) => handleSpecMsg(S, JSON.parse(m.data));
+  ws.onclose = () => { if (S.ws === ws) banner(`观众${k} 连接断开`); };
 }
 
-document.querySelector('#reconnect').onclick = () => connectSpectator(true);
-document.querySelector('#slowpoll').onchange = () => connectSpectator(false);
-document.querySelector('#delay').onchange = () => connectSpectator(false);
+function handleSpecMsg(S, msg) {
+  if (msg.clock != null) S.lastClock = msg.clock;
+  if (msg.kind === 'snapshot') {
+    if (msg.preview) {
+      S.preview = msg.state; S.previewT = msg.t;
+      checkSnapshot(S, msg);
+      return;
+    }
+    S.state = msg.state; S.state.t = msg.t; S.sessionId = msg.sessionId; S.lastSeq = msg.seq;
+    S.preview = null; S.seen = []; S.cloaked.clear(); S.lastScore = { ...msg.state.score };
+    checkSnapshot(S, msg);
+    banner(msg.rebuilt ? `已重建快照 @t=${msg.t.toFixed(1)}（显式重建，非读取当前内存）` : '');
+    slog(S, `— 快照 @t=${msg.t.toFixed(1)}${msg.rebuilt ? '（重建）' : ''} —`);
+  } else if (msg.kind === 'resume') {
+    banner(''); slog(S, `— 断线重连：从 seq=${msg.fromSeq} 继续 —`);
+  } else if (msg.kind === 'events') {
+    S.lastSeq = msg.lastSeq;
+    checkEvents(S, msg);
+    for (const ev of msg.events) handle(S, ev, false);
+  } else if (msg.kind === 'stalled') {
+    banner(`观战缓冲不足（${msg.reason}，丢弃 ${msg.dropped} 条）— 停留并重建`);
+    slog(S, `— 缓冲不足，停留 —`);
+  } else if (msg.kind === 'stall') {
+    banner(`数据未就绪（${msg.reason}），${(msg.retryAfterMs / 1000).toFixed(1)}s 后重试`);
+  } else if (msg.kind === 'end') {
+    banner(`比赛结束：${msg.result.winner} 胜`);
+    slog(S, `— 比赛结束：${JSON.stringify(msg.result.score)} —`);
+  } else if (msg.kind === 'status') {
+    renderStatus(msg);
+  }
+}
 
+// ---- anomaly checks on the delayed picture and the public state ----
+function flag(text) {
+  anomalyCount += 1;
+  anomalies.unshift(`观众${active} ${text}`);
+  if (anomalies.length > 6) anomalies.pop();
+  renderAnomalies();
+}
+function renderAnomalies() {
+  const el = document.querySelector('#anomaly');
+  if (anomalyCount === 0) {
+    el.className = 'anomaly ok';
+    el.textContent = '公开状态检查：无异常（未来事件 / 未公开对象 / 赛程泄漏 / 结果提前 / 隐身位置 / 计分先于原因 / 计分回退）';
+  } else {
+    el.className = 'anomaly bad';
+    el.textContent = `异常 ${anomalyCount} 条（延迟画面 / 公开状态）：\n${anomalies.join('\n')}`;
+  }
+}
+function checkEvents(S, msg) {
+  for (const ev of msg.events) {
+    if (ev.t > msg.clock + 1e-6) flag(`未来事件 ${ev.type} t=${ev.t.toFixed(1)} > 观战时钟 ${msg.clock.toFixed(1)}`);
+    if (ev.type === 'positions') {
+      for (const pid of Object.keys(ev.moves)) {
+        const until = S.cloaked.get(pid);
+        if (until && until > ev.t) flag(`隐身玩家 ${pid} 位置泄漏 t=${ev.t.toFixed(1)}`);
+      }
+    }
+    if (ev.type === 'score') {
+      const caused = S.seen.some((e) => e.t === ev.t && (
+        ((ev.reason === 'elimination' || ev.reason === 'trap') && e.type === 'death')
+        || (ev.reason === 'objective' && e.type === 'objective_captured')));
+      if (!caused) flag(`计分先于原因 t=${ev.t.toFixed(1)}（${ev.reason}）`);
+      S.lastScore = { ...S.lastScore, [ev.team]: ev.total };
+    }
+    if (ev.type === 'cloak_start') S.cloaked.set(ev.pid, ev.until);
+    if (ev.type === 'cloak_end') S.cloaked.delete(ev.pid);
+    S.seen.push(ev);
+    if (S.seen.length > 400) S.seen.splice(0, S.seen.length - 400);
+  }
+}
+function checkSnapshot(S, msg) {
+  const st = msg.state;
+  if (msg.t > msg.clock + 1e-6) flag(`快照来自未来 t=${msg.t.toFixed(1)}`);
+  if (st.scheduled && st.scheduled.length > 0) flag('快照泄漏未来赛程');
+  for (const o of Object.values(st.objects)) if (!o.revealed) flag(`快照泄漏未公开对象 ${o.id}`);
+  if (st.result && st.phase !== 'ended') flag('比赛结果提前泄漏');
+  if (!msg.preview) {
+    if (st.score.A < S.lastScore.A || st.score.B < S.lastScore.B) flag('计分回退异常');
+    S.lastScore = { ...st.score };
+  }
+}
+
+// ---- controls ----
+document.querySelector('#tabA').onclick = () => switchTab('A');
+document.querySelector('#tabB').onclick = () => switchTab('B');
+function switchTab(k) {
+  active = k;
+  document.querySelector('#tabA').classList.toggle('on', k === 'A');
+  document.querySelector('#tabB').classList.toggle('on', k === 'B');
+  document.querySelector('#seek').value = 0;
+  updateSeekLabel();
+}
+document.querySelector('#reconnect').onclick = () => connectSpec(active, true);
+document.querySelector('#slowpoll').onchange = () => connectSpec(active, false);
+document.querySelector('#opt').onchange = (e) => {
+  optimizedMode = e.target.checked;
+  for (const k of Object.keys(specs)) { specs[k].sessionId = null; connectSpec(k, false); }
+};
+const seekSlider = document.querySelector('#seek');
+seekSlider.addEventListener('input', () => {
+  const S = specs[active];
+  const back = Number(seekSlider.value);
+  updateSeekLabel();
+  if (back <= 0) { S.preview = null; return; }
+  if (S.ws && S.ws.readyState === 1) {
+    S.ws.send(JSON.stringify({ type: 'seek', t: Math.max(0, S.lastClock - back) }));
+  }
+});
+function updateSeekLabel() {
+  const back = Number(seekSlider.value);
+  document.querySelector('#seeklabel').textContent = back <= 0
+    ? '跟随延迟边缘'
+    : `回放预览：延迟边缘前 ${back.toFixed(1)}s`;
+}
+setInterval(() => {
+  const S = specs[active];
+  if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ type: 'status' }));
+}, 1000);
+
+function renderStatus(msg) {
+  const c = msg.cache;
+  const inv = Object.entries(c.invalidations).map(([k, v]) => `${k} ${v}`).join(' · ');
+  const log = (msg.cacheLog ?? []).map((x) => `${x.level}#${x.seq}:${x.reason}`).join(' ') || '无';
+  document.querySelector('#status').textContent = [
+    `延迟观战运行状态 · 模式：${msg.mode === 'optimized' ? '优化（共享缓存）' : '基线（每连接全量重建）'} · 会话：${msg.sessionState} · 观战时钟：${msg.clock.toFixed(1)}s`,
+    `缓存：请求 ${c.requests} · 命中 ${c.hits} · 增量 ${c.incremental} · 全量重建 ${c.fullRebuilds} · 事件应用 ${c.eventsApplied} · 投影 ${c.projections}`,
+    `失效：${inv} · 最近失效：${log} · 条目 ${JSON.stringify(msg.entries)} · 共享会话 ${msg.sessions} · 基线全量重建累计 ${msg.baseline.fullRebuilds}`,
+  ].join('\n');
+}
+
+// ---- shared rendering ----
 function handle(side, ev, isPlayer) {
   applyEvent(side.state, ev);
   if (ev.type === 'ability' && ev.ability === 'shot') {
     const p = side.state.players[ev.pid], q = side.state.players[ev.target];
     if (p && q) side.effects.push({ x1: p.x, y1: p.y, x2: q.x, y2: q.y, until: performance.now() + 150 });
   }
-  const L = isPlayer ? player.log : spec.log;
+  const L = isPlayer ? player.log : side.log;
   if (ev.type === 'death') L.push(`t=${ev.t.toFixed(1)} ${ev.by} 击杀 ${ev.pid}`);
   if (ev.type === 'score') L.push(`t=${ev.t.toFixed(1)} ${ev.team} 队得分（${ev.reason}）→ ${ev.total}`);
   if (ev.type === 'trap_revealed') L.push(`t=${ev.t.toFixed(1)} 陷阱暴露 @(${ev.x},${ev.y})`);
@@ -116,28 +259,29 @@ function handle(side, ev, isPlayer) {
 function slog(side, line) { side.log.push(line); if (side.log.length > 8) side.log.splice(0, side.log.length - 8); }
 function banner(text) { document.querySelector('#banner').textContent = text; }
 
-function draw(canvas, side, isPlayer) {
+function draw(canvas, state, effects, isPlayer) {
   const ctx = canvas.getContext('2d');
-  const st = side.state;
   ctx.clearRect(0, 0, 800, 600);
-  for (const o of Object.values(st.objectives)) {
+  for (const o of Object.values(state.objectives)) {
     if (!o.active) continue;
     ctx.fillStyle = '#3fd67c';
     ctx.beginPath(); ctx.moveTo(o.x, o.y - 12); ctx.lineTo(o.x + 12, o.y); ctx.lineTo(o.x, o.y + 12); ctx.lineTo(o.x - 12, o.y); ctx.fill();
   }
-  for (const o of Object.values(st.objects)) {
+  for (const o of Object.values(state.objects)) {
     if (o.kind !== 'trap') continue;
     const ownHidden = !o.revealed; // only possible in the player view (own team)
     ctx.fillStyle = ownHidden ? 'rgba(255,180,84,0.35)' : '#ffb454';
     ctx.beginPath(); ctx.moveTo(o.x, o.y - 8); ctx.lineTo(o.x + 8, o.y + 6); ctx.lineTo(o.x - 8, o.y + 6); ctx.fill();
   }
   const now = performance.now();
-  side.effects = side.effects.filter((e) => e.until > now);
-  for (const e of side.effects) {
+  for (let i = effects.length - 1; i >= 0; i -= 1) {
+    if (effects[i].until <= now) effects.splice(i, 1);
+  }
+  for (const e of effects) {
     ctx.strokeStyle = 'rgba(255,255,180,0.7)'; ctx.beginPath(); ctx.moveTo(e.x1, e.y1); ctx.lineTo(e.x2, e.y2); ctx.stroke();
   }
-  for (const p of Object.values(st.players)) {
-    const invisible = p.alive && p.invisibleUntil > st.t;
+  for (const p of Object.values(state.players)) {
+    const invisible = p.alive && p.invisibleUntil > state.t;
     if (invisible && !isPlayer) continue; // spectators must not see cloaked players
     if (!p.alive) { ctx.fillStyle = '#4a5265'; }
     else if (invisible) { ctx.fillStyle = p.team === 'A' ? 'rgba(90,162,255,0.3)' : 'rgba(255,106,90,0.3)'; }
@@ -156,23 +300,29 @@ function statsTable(el, st) {
 }
 
 function frame() {
-  draw(document.querySelector('#pc'), player, true);
-  draw(document.querySelector('#sc'), spec, false);
+  draw(document.querySelector('#pc'), player.state, player.effects, true);
+  const S = specs[active];
+  const back = Number(seekSlider.value);
+  const shown = (back > 0 && S.preview) ? S.preview : S.state;
+  draw(document.querySelector('#sc'), shown, S.effects, false);
   document.querySelector('#pt').textContent = player.state.t.toFixed(1);
-  document.querySelector('#st').textContent = spec.state.t.toFixed(1);
+  document.querySelector('#st').textContent = shown.t.toFixed(1);
   document.querySelector('#psa').textContent = player.state.score.A;
   document.querySelector('#psb').textContent = player.state.score.B;
-  document.querySelector('#ssa').textContent = spec.state.score.A;
-  document.querySelector('#ssb').textContent = spec.state.score.B;
+  document.querySelector('#ssa').textContent = shown.score.A;
+  document.querySelector('#ssb').textContent = shown.score.B;
+  document.querySelector('#sstate').textContent = back > 0 ? `回放预览 @t=${shown.t.toFixed(1)}` : '';
   document.querySelector('#plog').textContent = player.log.join('\n');
-  document.querySelector('#slog').textContent = spec.log.join('\n');
+  document.querySelector('#slog').textContent = S.log.join('\n');
   statsTable(document.querySelector('#pstats'), player.state);
-  statsTable(document.querySelector('#sstats'), spec.state);
+  statsTable(document.querySelector('#sstats'), shown);
   requestAnimationFrame(frame);
 }
 
 connectPlayer();
-connectSpectator();
+connectSpec('A');
+connectSpec('B');
+renderAnomalies();
 frame();
 </script>
 </body>

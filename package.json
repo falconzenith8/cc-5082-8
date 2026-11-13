@@ -5,8 +5,10 @@
   "private": true,
   "description": "Delay-rebuilt, information-filtered spectator view service for multiplayer matches",
   "scripts": {
-    "test": "node --test test/",
-    "demo": "node demo/server.js"
+    "test": "node --test",
+    "demo": "node demo/server.js",
+    "bench:load": "node bench/load.js",
+    "bench:memory": "node --expose-gc bench/memory.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

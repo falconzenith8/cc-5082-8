@@ -47,6 +47,20 @@ export class EventStore {
     }
     return out;
   }
+
+  // Seq of the last event with t <= T (firstSeq - 1 when none is retained).
+  // The folded state at clock T depends only on this prefix, so it is the
+  // natural cache key for "the spectator moment T".
+  seqAt(T) {
+    let lo = 0;
+    let hi = this.events.length - 1;
+    let ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.events[mid].t <= T) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return ans === -1 ? this.firstSeq - 1 : this.firstSeq + ans;
+  }
 }
 
 export class SnapshotStore {

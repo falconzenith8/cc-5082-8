@@ -66,3 +66,23 @@ export function sanitizeStateForPlayer(state, team) {
   }
   return out;
 }
+
+// Audience keys name an information-permission class: 'public' is the
+// delayed spectator stream, 'team:X' is team X's insider view. Cache entries
+// are keyed by audience so a projection built for one permission class can
+// never be served to another.
+export function isAudience(audience) {
+  return audience === 'public' || /^team:[AB]$/.test(audience);
+}
+
+export function sanitizeEventForAudience(ev, audience) {
+  if (audience === 'public') return sanitizeEventForSpectator(ev);
+  if (audience.startsWith('team:')) return sanitizeEventForPlayer(ev, audience.slice(5));
+  throw new Error(`unknown audience: ${audience}`);
+}
+
+export function sanitizeStateForAudience(state, audience) {
+  if (audience === 'public') return sanitizeStateForSpectator(state);
+  if (audience.startsWith('team:')) return sanitizeStateForPlayer(state, audience.slice(5));
+  throw new Error(`unknown audience: ${audience}`);
+}

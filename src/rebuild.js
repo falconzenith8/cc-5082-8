@@ -7,7 +7,10 @@ import { applyEvent } from './state.js';
 // Returns null when the data needed for an exact rebuild is not available
 // (no snapshot old enough, or the event segment was dropped by retention).
 // Callers must treat null as "stay / wait", never guess.
-export function rebuildAt(events, snapshots, T) {
+//
+// The optional stats counter records real executions (events applied), so
+// benchmarks can report work actually done instead of inferring it.
+export function rebuildAt(events, snapshots, T, stats) {
   const snap = snapshots.floor(T);
   if (!snap) return null;
   if (events.firstSeq > snap.seq + 1) return null; // event gap: cannot rebuild exactly
@@ -16,6 +19,7 @@ export function rebuildAt(events, snapshots, T) {
   let t = snap.t;
   for (const ev of events.range(snap.seq, T)) {
     applyEvent(state, ev);
+    if (stats) stats.eventsApplied += 1;
     seq = ev.seq;
     t = ev.t;
   }
